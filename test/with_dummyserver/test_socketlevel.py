@@ -12,6 +12,7 @@ import select
 import shutil
 import socket
 import ssl
+import sys
 import tempfile
 import threading
 import time
@@ -1027,6 +1028,10 @@ class TestSocketClosing(SocketDummyServerTestCase):
             ssl_sock.sendall(b"hello")
             assert ssl_sock.fileno() > 0
 
+    @pytest.mark.skipif(
+        sys.version_info[:3] == (3, 9, 2) and ssl.OPENSSL_VERSION_INFO[0] >= 3,
+        reason="CPython 3.9.2 against OpenSSL 3.0 (upstream leg used 1.1.1)",
+    )
     def test_socket_shutdown_stops_recv(self) -> None:
         timed_out, starting_read = Event(), Event()
 
@@ -1230,8 +1235,12 @@ class TestProxyManager(SocketDummyServerTestCase):
                 proxy.request("GET", "https://localhost/")
 
         done_receiving.wait()
-        assert b"http/1.1" in self.buf
-        assert b"h2" not in self.buf
+        assert b"\x08http/1.1" in self.buf
+        # ALPN protocol names are length-prefixed, so an advertised "h2"
+        # is sent as b"\x02h2". A bare b"h2" also matches the random
+        # bytes of the TLS handshake (client random, session ID, key
+        # share) from time to time, which made this test flaky.
+        assert b"\x02h2" not in self.buf
 
     def test_connect_reconn(self) -> None:
         def proxy_ssl_one(listener: socket.socket) -> None:
@@ -1753,6 +1762,12 @@ class TestSSL(SocketDummyServerTestCase):
         with pytest.raises(SSLError):
             ssl_wrap_socket(None, ca_certs="/tmp/fake-file")  # type: ignore[call-overload]
 
+    @pytest.mark.skipif(
+        sys.platform == "win32",
+        reason="Seal: the test's is_closed_socket() helper infers peer teardown from "
+        "sock.settimeout() raising OSError, which Winsock does not do after a peer reset. "
+        "urllib3's behavior is correct; the detection mechanism is POSIX-specific.",
+    )
     def test_ssl_custom_validation_failure_terminates(self, tmpdir: Path) -> None:
         """
         Ensure that the underlying socket is terminated if custom validation fails.

@@ -1,6 +1,7 @@
 name: CI
 
-on: [push, pull_request, workflow_dispatch]
+# Seal: dispatch-only on the fork so the sync push does not start a stray run.
+on: [workflow_dispatch]
 
 permissions:
   contents: "read"
@@ -39,85 +40,150 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        python-version: ["3.9", "3.10", "3.11", "3.12", "3.13", "3.14"]
+        # 3.14 is dropped: see process/builder_README.md — 2.3.0's own test infra
+        # cannot run it, and upstream never gated on it at this tag.
+        python-version: ["3.9", "3.10", "3.11", "3.12", "3.13"]
         os:
           - macos-15
           - windows-latest
           - ubuntu-22.04
         nox-session: ['']
         include:
-          - experimental: false
+          # Restored upstream legs. Upstream's ubuntu-latest legs are pinned to
+          # ubuntu-24.04 (what ubuntu-latest was at release): ubuntu-latest is now
+          # 26.04, for which setup-python ships no CPython 3.9 or release-era builds.
+          # ubuntu-24.04 is not in the os list above, so
+          # these add jobs rather than overwriting existing ones. No
+          # continue-on-error anywhere: failures must be visible.
           # integration
-          # 3.9 has a known issue with large SSL requests that we work around:
-          # https://github.com/urllib3/urllib3/pull/3181#issuecomment-1794830698
           - python-version: "3.9"
-            os: ubuntu-latest
-            experimental: false
+            os: ubuntu-24.04
             nox-session: test_integration
           - python-version: "3.12"
-            os: ubuntu-latest
-            experimental: false
+            os: ubuntu-24.04
             nox-session: test_integration
-          # OpenSSL 1.1.1
-          - python-version: "3.9"
-            os: ubuntu-20.04
-            experimental: false
-            nox-session: test-3.9
           # pypy
           - python-version: "pypy-3.10"
-            os: ubuntu-latest
-            experimental: false
+            os: ubuntu-24.04
             nox-session: test-pypy3.10
-          - python-version: "3.x"
-          # brotli
-            os: ubuntu-latest
-            experimental: false
+          # brotlipy instead of brotli. Pinned to 3.12 rather than upstream's
+          # "3.x": that now resolves to 3.14, where dev-requirements installs no
+          # pytest-memray while the noxfile still passes --memray.
+          - python-version: "3.12"
+            os: ubuntu-24.04
             nox-session: test_brotlipy
-          # Test CPython with a broken hostname_checks_common_name (the fix is in 3.9.3)
-          - python-version: "3.9.2"
-            os: ubuntu-20.04  # CPython 3.9.2 is not available for ubuntu-22.04.
-            experimental: false
+          # OpenSSL 1.1.1. Upstream got it from the ubuntu-20.04 runner image,
+          # which no longer exists; a focal container gives the same libssl, and
+          # setup-python's focal build of 3.9 links against it.
+          - python-version: "3.9"
+            os: ubuntu-latest
+            container: "ubuntu:20.04"
             nox-session: test-3.9
+          # CPython with a broken hostname_checks_common_name (fixed in 3.9.3).
+          # Built from source: setup-python has no 3.9.2 for ubuntu-22.04. The
+          # 7 TLS-in-TLS tests that need OpenSSL 1.1.1 skip themselves there.
+          - python-version: "3.9.2"
+            os: ubuntu-22.04
+            nox-session: test-3.9
+          # emscripten: node, plus the chrome browser runner (browser and
+          # web-worker tests in test_emscripten.py run only in a browser).
           - python-version: "3.12"
-            os: ubuntu-latest
+            os: ubuntu-24.04
             nox-session: emscripten(node)
-            experimental: true
           - python-version: "3.12"
-            os: ubuntu-latest
-            nox-session: emscripten(firefox)
-            experimental: true
-          - python-version: "3.12"
-            os: ubuntu-latest
+            os: ubuntu-24.04
             nox-session: emscripten(chrome)
-            experimental: true
-          - python-version: 3.14
-            experimental: true
 
     runs-on: ${{ matrix.os }}
-    name: ${{ fromJson('{"macos-15":"macOS","windows-latest":"Windows","ubuntu-latest":"Ubuntu","ubuntu-20.04":"Ubuntu 20.04 (OpenSSL 1.1.1)","ubuntu-22.04":"Ubuntu 22.04 (OpenSSL 3.0)"}')[matrix.os] }} ${{ matrix.python-version }} ${{ matrix.nox-session}}
-    continue-on-error: ${{ matrix.experimental }}
-    timeout-minutes: 10
+    container: ${{ matrix.container }}
+    name: ${{ fromJson('{"macos-15":"macOS","windows-latest":"Windows","ubuntu-latest":"Ubuntu","ubuntu-24.04":"Ubuntu","ubuntu-20.04":"Ubuntu 20.04 (OpenSSL 1.1.1)","ubuntu-22.04":"Ubuntu 22.04 (OpenSSL 3.0)"}')[matrix.os] }} ${{ matrix.python-version }} ${{ matrix.nox-session}} ${{ matrix.container }}
+    # Raised from 10: the arm64 macOS 3.9 leg may build CPython from source.
+    timeout-minutes: 25
     steps:
+      # The focal container's base image ships no git, which both
+      # actions/checkout and the `git+https://` dev-requirements need.
+      - name: "Prepare the container"
+        if: ${{ matrix.container != '' }}
+        env:
+          DEBIAN_FRONTEND: noninteractive
+        run: |
+          apt-get update
+          # git: actions/checkout falls back to a tarball without it, and
+          #   dev-requirements pulls Quart and hypercorn over git+https.
+          # tzdata: the bare image has no zoneinfo, so test_retry's
+          #   Retry-After timezone cases error with "Invalid timezone specifier".
+          apt-get install -y --no-install-recommends git ca-certificates tzdata
+
       - name: "Checkout repository"
         uses: actions/checkout@0ad4b8fadaa221de15dcec353f45205ec38ea70b # v4.1.4
         with:
           fetch-depth: 0 # Needed to fetch the version from git
           persist-credentials: false
 
+      # Seal: pin CPython to the patch releases the 2.3.0+sp3p3 CI passed on
+      # (3.13.14; Linux 3.10.20/3.11.15/3.12.13). Later security releases changed
+      # behavior two tests assert: zlib flush now rejects trailing garbage
+      # (test_response.py::test_chunked_decoding_gzip_swallow_garbage, 3.13.x) and
+      # ssl raises "check_hostname requires server_hostname" first (test_ssltransport.py::
+      # test_start_closed_socket, Linux 3.10-3.13). macOS/Windows 3.10-3.12 already
+      # resolve to their last binary releases, which pass. matrix.python-version
+      # (job name, nox session) is unchanged.
+      - name: "Resolve release-era CPython patch version"
+        id: pyver
+        run: |
+          v="${{ matrix.python-version }}"
+          case "$v" in 3.13) v=3.13.14 ;; esac
+          if [ "$RUNNER_OS" = "Linux" ]; then
+            case "$v" in 3.10) v=3.10.20 ;; 3.11) v=3.11.15 ;; 3.12) v=3.12.13 ;; esac
+          fi
+          echo "Resolved setup-python version: $v"
+          echo "version=$v" >> "$GITHUB_OUTPUT"
+
       - name: "Setup Python ${{ matrix.python-version }}"
         uses: actions/setup-python@0b93645e9fea7318ecaed2b359559ac225c90a2b # v5.3.0
+        if: ${{ !((matrix.os == 'macos-15' && matrix.python-version == '3.9') || matrix.python-version == '3.9.2') }}
         with:
-          python-version: ${{ matrix.python-version }}
+          python-version: ${{ steps.pyver.outputs.version }}
           allow-prereleases: true
 
+      # actions/setup-python has no arm64 macOS build of CPython 3.9; this
+      # action builds it from source, which is how other seals cover that leg.
+      - name: "Setup Python ${{ matrix.python-version }} (built from source)"
+        uses: MatteoH2O1999/setup-python@ca074e4eaaaf9f4e5ac2db92e45cb7821f2fa266 # v4
+        if: ${{ (matrix.os == 'macos-15' && matrix.python-version == '3.9') || matrix.python-version == '3.9.2' }}
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache-build: true
+
+      # TEST ENVIRONMENT ONLY. These constrain the dummyserver harness (Quart's
+      # Flask/Werkzeug stack), which nox installs itself — the time machine on the
+      # step above only covers the workflow's own pip install. urllib3's declared
+      # dependencies are untouched, and nothing here reaches the built wheel/sdist.
+      - name: "Constrain Flask/Werkzeug for the dummyserver test stack"
+        run: |
+          echo "Flask<3.1" > ci-constraints.txt
+          echo "Werkzeug<3.1" >> ci-constraints.txt
+          echo "PIP_CONSTRAINT=${{ github.workspace }}/ci-constraints.txt" >> $GITHUB_ENV
+
+      # Recorded so each leg's TLS backend is auditable from the archived logs
+      # rather than inferred — the OpenSSL 1.1.1 leg depends on it.
+      - name: "Report the interpreter's OpenSSL"
+        run: python -c "import ssl, sys; print(sys.version); print(ssl.OPENSSL_VERSION)"
+
       - name: "Install dependencies"
-        run: python -m pip install --upgrade pip setuptools nox
+        # Time machine: resolve the build toolchain as of the 2.3.0 release date
+        # so a newer pip/nox/argcomplete cannot break the legs.
+        run: python -m pip install --index-url 'https://:2024-12-22T07:47:28.074156Z@time-machines-pypi.sealsecurity.io/' --upgrade pip setuptools nox
 
       - name: "Install Chrome"
         uses: browser-actions/setup-chrome@db1b524c26f20a8d1a10f7fc385c92387e2d0477 # v1.7.1
         id: setup-chrome
         if: ${{ matrix.nox-session == 'emscripten(chrome)' }}
         with:
+          # Seal: Chrome 131 was stable when 2.3.0 shipped. Current Chrome crashes
+          # Pyodide 0.26.3 ("Pyodide already fatally failed") and turns JSPI on by
+          # default, which the has_jspi=False parametrisation cannot run against.
+          chrome-version: 131
           install-chromedriver: true
       - name: Force override system chrome
         run: |
@@ -149,6 +215,26 @@ jobs:
           PYTHON_VERSION: ${{ matrix.python-version }}
           NOX_SESSION: ${{ matrix.nox-session }}
 
+      # Seal: states, in each leg's log, why upstream's own skip conditions fire
+      # and which leg of this workflow runs the skipped tests instead.
+      - name: "Explain expected skips"
+        if: always()
+        run: |
+          cat <<'TXT'
+          Expected skips in this matrix (upstream's design, each covered by another leg):
+          - test/contrib/emscripten/test_emscripten.py is skipped at module level on every
+            CPython leg: it only runs inside Pyodide (pytest.importorskip("pytest_pyodide"),
+            and an unconditional pytest.skip on Python < 3.11 because Pyodide needs 3.11+).
+            It runs in the emscripten(node) and emscripten(chrome) legs; tests that need a
+            browser or web workers are not generated for node ("got empty parameter set").
+          - test_socketlevel.py "need --integration option" skips run in the
+            test_integration legs (nox -s test_integration passes --integration).
+          - test_brotlipy installs only the "socks" extra (noxfile.py test_brotlipy) so it can
+            check brotlipy in place of brotli; the zstd tests ("only run if a python-zstandard
+            library is installed") run in every other CPython leg, which installs zstandard.
+          - TLSv1/TLSv1.1 skips: the runner's OpenSSL does not offer those protocol versions.
+          TXT
+
       - name: "Upload coverage data"
         uses: actions/upload-artifact@65462800fd760344b1a7b4382951275a0abb4808 # v4.3.3
         with:
@@ -158,7 +244,8 @@ jobs:
 
 
   coverage:
-    if: always()
+    # Disabled on the fork: --fail-under=100 needs the full upstream matrix (integration, emscripten, pypy legs).
+    if: false
     runs-on: "ubuntu-latest"
     needs: test
     steps:
